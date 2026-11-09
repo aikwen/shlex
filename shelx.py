@@ -303,34 +303,88 @@ class shlex:
         return token
 
 def split(s, comments=False, posix=True):
-    """Split the string *s* using shell-like syntax."""
+    """Split the string *s* using shell-like syntax.
+    s	         必填	   需要分词的字符串
+    comments	 False	是否将注释符识别为注释起始
+    posix	     True	是否启用 POSIX 风格的 Shell 解析规则
+
+    curl -H 'Content-Type: application/json'
+
+    会被分词为 ['curl', '-H', 'Content-Type: application/json']
+    """
+
+    # 兼容旧版本允许传入 None 的行为，并发出弃用警告。
     if s is None:
         import warnings
         warnings.warn("Passing None for 's' to shlex.split() is deprecated.",
                       DeprecationWarning, stacklevel=2)
+
+    # 实例化一个 shlex 类对象。
     lex = shlex(s, posix=posix)
+
+    # 使用空白字符作为 Token 的分隔依据，同时遵守引号和转义规则。
     lex.whitespace_split = True
+
+    # 默认情况下，shlex 使用 # 作为注释起始字符。
+    # 没有开启注释的时候，那么就关闭注释识别。
     if not comments:
         lex.commenters = ''
+
+    # 通过迭代器协议逐个获取 Token，并将结果转换为列表。
     return list(lex)
 
 
+# 将 Token 序列重新组合为 Shell 命令，可以理解为 split() 的逆向操作。
+# 注意：不保证恢复原始命令的引号格式，只保证参数含义。
 def join(split_command):
     """Return a shell-escaped string from *split_command*."""
     return ' '.join(quote(arg) for arg in split_command)
 
-
+# 判断单个参数是否需要 Shell 引号保护。
+# 匹配不在以下安全字符集合中的任意字符：
+# \w	       英文字母、数字、下划线（在 re.ASCII 下）
+# @%+=:,./-	   字符
+# 
 _find_unsafe = re.compile(r'[^\w@%+=:,./-]', re.ASCII).search
+
 
 def quote(s):
     """Return a shell-escaped version of the string *s*."""
+
+    # 空字符串必须使用 '' 表示，否则 Shell 会认为不存在该参数。
     if not s:
         return "''"
+
+    # 没有不安全字符，直接返回
     if _find_unsafe(s) is None:
         return s
 
     # use single quotes, and put single quotes into double quotes
     # the string $'b is then quoted as '$'"'"'b'
+    # 
+    # 使用单引号保护整个字符串，避免 Shell 解释特殊字符。
+    #
+    # 单引号内部无法直接包含单引号，因此需要：
+    # 1. 结束当前单引号
+    # 2. 使用双引号表示一个字面量单引号
+    # 3. 重新开启单引号
+    #
+    # 例如：
+    # it's ok  ->  'it'"'"'s ok'
+    # 
+    # 其中 
+    # 
+    # 'it'   - it
+    # "'"    - '
+    # 's ok' - s ok
+    #
+    # Shell 中，没有未被引用的分隔符隔开时，相邻的字符串片段会组成同一个参数，而不是自动插入空格。
+    # 'hello''world'	  helloworld
+    # 'hello' 'world'	  两个参数：hello、world
+    # 'hello' "world"	  两个参数：hello、world
+    # 'hello'"world"	  helloworld
+    # 'hello' ' world'	  两个参数：hello、 world
+    # 'hello' " world"   （无中间空格）	hello world
     return "'" + s.replace("'", "'\"'\"'") + "'"
 
 
@@ -345,6 +399,6 @@ if __name__ == '__main__':
     if len(sys.argv) == 1:
         _print_tokens(shlex())
     else:
-        fn = sys.argv[1]
+        fn: str = sys.argv[1]
         with open(fn) as f:
             _print_tokens(shlex(f, fn))
