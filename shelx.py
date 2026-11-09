@@ -20,49 +20,132 @@ class shlex:
     "A lexical analyzer class for simple shell-like syntaxes."
     def __init__(self, instream=None, infile=None, posix=False,
                  punctuation_chars=False):
+        """
+        instream	输入来源，可以是字符串或文件流
+        infile	    输入文件名称，主要用于错误信息
+        posix	    是否使用 POSIX 风格的解析模式
+        punctuation_chars	是否将某些 Shell 标点符号作为独立 Token 处理
+        """
+        
         if isinstance(instream, str):
+            # 包装成一个类似文件的内存流
+            # from io import StringIO
+            #
+            # stream = StringIO("hello world")
+            # print(stream.read(1))  # h
+            # print(stream.read(1))  # e
+            # print(stream.read(1))  # l
+            # 
+            # 包装为 StringIO 后，两种输入都能通过 read() 操作。
             instream = StringIO(instream)
         if instream is not None:
             self.instream = instream
             self.infile = infile
         else:
+            # 如果 instream=None，它默认使用 sys.stdin
             self.instream = sys.stdin
             self.infile = None
         self.posix = posix
+
+        # EOF 是 End Of File，表示输入已经结束。
+        # 
+        # POSIX 模式：   None 表示 EOF，因为在 POSIX 模式中，空字符串 '' 本身可以是一个合法的 Token。
+        # 非 POSIX 模式：'' 表示 EOF。
         if posix:
             self.eof = None
         else:
             self.eof = ''
+
+        # 定义各种字符的处理规则。
+        # 
+        # 注释起始字符
         self.commenters = '#'
+        # 可以组成普通单词的字符
         self.wordchars = ('abcdfeghijklmnopqrstuvwxyz'
                           'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_')
         if self.posix:
             self.wordchars += ('ßàáâãäåæçèéêëìíîïðñòóôõöøùúûüýþÿ'
                                'ÀÁÂÃÄÅÆÇÈÉÊËÌÍÎÏÐÑÒÓÔÕÖØÙÚÛÜÝÞ')
+        # 空白字符集合
         self.whitespace = ' \t\r\n'
+        # 是否按空白字符进行分词
         self.whitespace_split = False
+
+        # 单引号和双引号都会触发引用状态。
         self.quotes = '\'"'
+        # 转义字符
         self.escape = '\\'
+        # 在 POSIX 模式下允许使用反斜杠转义的引用类型
         self.escapedquotes = '"'
+
+        # 当前词法分析状态
         self.state = ' '
+        # 已读取但需要放回的 Token
         self.pushback = deque()
+        # 当前行号，主要用于错误定位
         self.lineno = 1
+        # 调试信息级别
         self.debug = 0
+        # 当前正在构造的 Token
         self.token = ''
+        # 输入源堆栈
         self.filestack = deque()
+        # 输入源切换相关配置
         self.source = None
+
+        # 配置 Shell 标点符号的分词规则。
+        # False：禁用特殊标点分词。
+        # True：使用默认集合 '();<>|&'。
+        # str：使用用户指定的标点符号集合。
         if not punctuation_chars:
             punctuation_chars = ''
         elif punctuation_chars is True:
             punctuation_chars = '();<>|&'
+        
         self._punctuation_chars = punctuation_chars
+
+        # 在启用 punctuation_chars=True 后， 而且在 whitespace_split=False 的默认分词模式下：
+        # 
+        # echo hello && echo world 或者 echo hello&&echo world
+        # 
+        # && 会被识别为一个独立的 Token，即使它和其他字符之间没有空格。
+        # 
+        # ['echo', 'hello', '&&', 'echo', 'world']
+        # 
         if punctuation_chars:
             # _pushback_chars is a push back queue used by lookahead logic
+            # 字符级回退队列，用于前瞻（Lookahead）。
+            # 如果提前读取的字符不属于当前 Token，
+            # 可以先将它放回队列，留给下一次读取。
             self._pushback_chars = deque()
             # these chars added because allowed in file names, args, wildcards
             self.wordchars += '~-./*?='
             #remove any punctuation chars from wordchars
+
+            # 假设 self.wordchars = "abc123_="  punctuation_chars = "_="
+            # 
+            # dict.fromkeys  将每个标点字符映射为 None。
+            # 会得到 {'_': None, '=': None}
+            # 
+            # str.translate() 使用的转换表，通常需要以 Unicode 码点（整数） 作为 Key。
+            # t = str.maketrans({
+            #    "_": None,
+            #    "=": None,
+            # })
+            # 得到了 
+            # {
+            #    95: None,
+            #    61: None,
+            # }
             t = self.wordchars.maketrans(dict.fromkeys(punctuation_chars))
+
+            # 根据映射表转换字符串，映射值为 None 时删除字符；
+            # 映射值为字符串或 Unicode 码点时执行替换；
+            # 没有映射规则的字符保持不变。
+            # 
+            # 将指定的特殊标点从普通单词字符集合中移除，
+            # 避免同一个字符同时属于 wordchars 和 punctuation_chars。
+            # 例如 punctuation_chars="=" 时，确保 = 按特殊标点规则处理。
             self.wordchars = self.wordchars.translate(t)
 
     @property
@@ -294,11 +377,23 @@ class shlex:
         return "\"%s\", line %d: " % (infile, lineno)
 
     def __iter__(self):
+        # shlex 本身就是一个迭代器（Iterator）。
+        # Iterable（可迭代对象）：能够通过 iter() 获取迭代器。
+        # Iterator（迭代器）   ：能够通过 next() 逐个获取元素，并且自身也可迭代。
         return self
 
     def __next__(self):
+        # 获取下一个token
         token = self.get_token()
+
+        # 对应前面的
+        # if posix:
+        #     self.eof = None
+        # else:
+        #     self.eof = ''
         if token == self.eof:
+
+            # StopIteration 是 Python 迭代器协议规定的结束信号。
             raise StopIteration
         return token
 
@@ -320,7 +415,7 @@ def split(s, comments=False, posix=True):
                       DeprecationWarning, stacklevel=2)
 
     # 实例化一个 shlex 类对象。
-    lex = shlex(s, posix=posix)
+    lex = shlex(instream=s, posix=posix)
 
     # 使用空白字符作为 Token 的分隔依据，同时遵守引号和转义规则。
     lex.whitespace_split = True
