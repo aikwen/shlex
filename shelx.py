@@ -78,7 +78,7 @@ class shlex:
         # 在 POSIX 模式下允许使用反斜杠转义的引用类型
         self.escapedquotes = '"'
 
-        # 当前词法分析状态
+        # 当前词法分析状态，初始状态是 ' '
         self.state = ' '
         # 已读取但需要放回的 Token
         self.pushback = deque()
@@ -183,29 +183,66 @@ class shlex:
 
     def get_token(self):
         "Get a token from the input stream (or from stack if it's nonempty)"
+        # 优先读取通过 push_token() 放回的 Token。
+        # push_token() 使用 appendleft()，因此最近放回的 Token 会最先返回。
         if self.pushback:
             tok = self.pushback.popleft()
             if self.debug >= 1:
                 print("shlex: popping token " + repr(tok))
             return tok
+
         # No pushback.  Get a token.
+        # 从read_token 拿到
         raw = self.read_token()
+
         # Handle inclusions
+        # 这里的source 作用是 shlex 自己提供的一种输入源包含机制
+        # 允许词法分析器在读取一个输入源时，暂时切换到另一个输入源。
+        # 假设 lex.source = "source" 那么遇到 source 这个 Token 时，shlex 会尝试将后面的 Token 当成一个输入源名称。
+        # 
+        # 比如要处理的文本字段是 hello source extra.txt world
+        # 如果 sourcehook() 成功打开 extra.txt，就可以先读取其中的内容，再回来继续读取 world。
         if self.source is not None:
+            # 发现有source
             while raw == self.source:
+                # 那么就让下一个token作为source输入到sourcehook里面
                 spec = self.sourcehook(self.read_token())
                 if spec:
                     (newfile, newstream) = spec
                     self.push_source(newstream, newfile)
+                # 递归调用 get_token()，继续获取下一个有效 Token。
+                # 如果成功切换输入源，就从新输入源读取。
                 raw = self.get_token()
+
+
         # Maybe we got EOF instead?
         while raw == self.eof:
+            # 如果当前输入流结束（filestack用于保存之前的输入源。）
+            # - filestack 为空：说明没有其他输入源需要恢复，返回 EOF。
+            # - filestack 非空：说明当前只是嵌套输入源结束，需要恢复上一层输入源。
             if not self.filestack:
                 return self.eof
             else:
+                ## 递归调用了这里
+                # get_token()
+                #    │
+                #    ├── 发现 source a.txt
+                #    │
+                #    └── get_token()
+                #            │
+                #            ├── 发现 source b.txt
+                #            │
+                #            └── get_token()
+                #                    │
+                #                    └── 读取 b.txt 的 Token
+                # 当前输入源结束，恢复上一层输入源。
                 self.pop_source()
+                # 递归调用，继续从恢复后的输入源获取 Token。
                 raw = self.get_token()
+
+
         # Neither inclusion nor EOF
+        # 输出调试信息。
         if self.debug >= 1:
             if raw != self.eof:
                 print("shlex: token=" + repr(raw))
@@ -214,128 +251,278 @@ class shlex:
         return raw
 
     def read_token(self):
+        # 当前正在生成的 Token 是否经过引号引用。
+        # - self.state：当前处于什么解析状态。
+        # - quoted：当前 Token 是否曾经进入过引号状态。
+        # 
+        # 比如 echo '' 
+        # 其中 '' 代表一个真正存在的空参数。
+        # 由于空字符串的布尔值为 False，解析器就可能把这个合法的空参数丢掉。
+        # 
+        # 
         quoted = False
+
+        
+        # 记录进入转义状态之前，处理完成后应该恢复到哪个状态。
+        # 比如 echo hello\ world
+        # 
+        # 1. 当前处于普通单词状态 'a'。
+        # 2. 遇到 \，进入转义状态。
+        # 3. 将 escapedstate 保存为 'a'。
+        # 4. 读取被转义的空格，将它添加到当前 Token。
+        # 5. 恢复状态 'a'，继续读取。
+        # 
         escapedstate = ' '
+
+        # 循环会不断读取字符，直到：
+        # - 识别出一个完整 Token。
+        # - 遇到 EOF。
+        # - 遇到无法处理的引用或转义错误。
         while True:
+
+            # 如果启用了标点处理，而且回退缓冲区中存在字符，就优先取出。
+            # 否则从输入流中读取一个新字符。
             if self.punctuation_chars and self._pushback_chars:
                 nextchar = self._pushback_chars.pop()
             else:
                 nextchar = self.instream.read(1)
+
+            # 每当本轮取得的字符为换行符时，行号加一。
+            # 字符可能来自输入流，也可能来自字符回退缓冲区。
             if nextchar == '\n':
                 self.lineno += 1
+            
+            # 调试输出,当调试等级至少为 3 时，打印：
+            # - 当前状态 self.state。
+            # - 当前读取的字符 nextchar。
             if self.debug >= 3:
                 print("shlex: in state %r I see character: %r" % (self.state,
                                                                   nextchar))
+
+            """
+            状态	          含义	               示例
+            None	     输入已经结束	              EOF
+            ' '	         等待开始新的 Token	    空白分隔区
+            ' 或 "	    正在读取引用字符串	   'hello world'
+            \	         正在处理转义字符        hello\ world
+            'a'	         正在读取普通单词	        hello
+            'c'	         正在读取连续特殊标点	     &&、\|\|
+            """
+
+            # 词法分析器已经到达 EOF
             if self.state is None:
+                # 清空当前 Token。
                 self.token = ''        # past end of file
                 break
+
+            # 当前处于 Token 之间，等待新 Token 开始
             elif self.state == ' ':
+                # 下一个nextchar 为 None或者为 空字符串
                 if not nextchar:
                     self.state = None  # end of file
                     break
+                # 如果下一个字符是空白字符
+                # 识别这几种： ' \t\r\n'
                 elif nextchar in self.whitespace:
                     if self.debug >= 2:
                         print("shlex: I see whitespace in whitespace state")
+
+                    # 如果已经构造出 Token，或者在 POSIX 模式下已经处理过引号，就结束当前 Token。否则继续跳过空白字符。
                     if self.token or (self.posix and quoted):
                         break   # emit current token
                     else:
-                        continue
+                        continue                                                                                                
+
+                # commenters=#
                 elif nextchar in self.commenters:
+                    # 只要读取到了 注释读取一行
                     self.instream.readline()
                     self.lineno += 1
+
+                # 当前词法分析器正处于等待新 Token 开始的状态。
+                # 其中 self.escape = '\\'
+                # 
                 elif self.posix and nextchar in self.escape:
                     escapedstate = 'a'
+
+                    # self.state = '\\' 下一轮循环会进入 elif self.state in self.escape:
                     self.state = nextchar
+
+                # 普通单词字符
                 elif nextchar in self.wordchars:
                     self.token = nextchar
+                     # 进入普通单词状态，后续继续构造 Token。
                     self.state = 'a'
+
+                # 如果启用了标点符号解析，且当前字符属于指定的标点集合，
+                # 则以该字符开始一个新的 Token。
                 elif nextchar in self.punctuation_chars:
                     self.token = nextchar
+                    # 进入连续标点符号处理状态。
                     self.state = 'c'
+
+                # self.quotes = '\'"'
                 elif nextchar in self.quotes:
+                    # 非 POSIX 模式会保留起始引号。
+                    # 当前使用 posix=True，因此不执行。
                     if not self.posix:
                         self.token = nextchar
+                        # 使用当前引号字符作为状态标识。
                     self.state = nextchar
+
+                # 例如，在 self.state == ' ' 的情况下读取到 @：
+                # 1. @ 不属于默认的 wordchars。
+                # 2. 没有启用 punctuation_chars。
+                # 3. @ 也不是引号、空白字符或转义符。
+                # 4. 因此进入 whitespace_split 分支。
+                # 
+                # 将前面分支未处理的字符作为新 Token 的起始字符。
                 elif self.whitespace_split:
                     self.token = nextchar
                     self.state = 'a'
+                # 主要用于 whitespace_split=False 的情况。
                 else:
+                    # 将当前字符设置为 Token。
                     self.token = nextchar
+
+                    # 如果当前 Token 非空，就执行 break，退出 while True。
+                    # 即使 Token 是空字符串，如果它来自 POSIX 模式下的引用内容，也可能是一个合法的空 Token。
                     if self.token or (self.posix and quoted):
                         break   # emit current token
                     else:
                         continue
             elif self.state in self.quotes:
+                # 标记已经进入了引号状态
                 quoted = True
+
+                # 引号没有正常闭合
                 if not nextchar:      # end of file
                     if self.debug >= 2:
                         print("shlex: I see EOF in quotes state")
                     # XXX what error should be raised here?
                     raise ValueError("No closing quotation")
+
+                # 如果当前处于单引号状态，self.state = "'"。
+                # 如果当前处于双引号状态，self.state = '"'。
                 if nextchar == self.state:
                     if not self.posix:
                         self.token += nextchar
                         self.state = ' '
                         break
+                    # 在 posix 状态下，状态会变成 a
                     else:
                         self.state = 'a'
+
+                # self.posix == True
+                # 当前字符是反斜杠 \
+                # 
+                #  self.escapedquotes = '"' 
+                # 所以 self.state 是双引号，同时当前状态是单引号；
                 elif (self.posix and nextchar in self.escape and self.state
                       in self.escapedquotes):
+                          
                     escapedstate = self.state
                     self.state = nextchar
+               
+                # 如果当前字符既不是结束引号，也没有触发转义处理，就直接追加到当前 Token。
                 else:
                     self.token += nextchar
+
+            # self.escape = '\\'， 当前处于反斜杠转义状态
             elif self.state in self.escape:
+                # 检查 EOF
                 if not nextchar:      # end of file
                     if self.debug >= 2:
                         print("shlex: I see EOF in escape state")
                     # XXX what error should be raised here?
                     raise ValueError("No escaped character")
+                
                 # In posix shells, only the quote itself or the escape
                 # character may be escaped within quotes.
-                if (escapedstate in self.quotes and
-                        nextchar != self.state and nextchar != escapedstate):
+                # 
+                # self.state：当前是反斜杠状态，即 '\\'。
+                # escapedstate：进入转义状态前记录的恢复状态，可能是 'a' 或 '"'
+                if (
+                    
+                    escapedstate in self.quotes and
+                        # 下一个字符不是反斜杠
+                        nextchar != self.state and 
+                        # 下一个字符不是当前引号字符
+                        nextchar != escapedstate):
                     self.token += self.state
+                
                 self.token += nextchar
+                # 返回转义前指定的状态。
                 self.state = escapedstate
+
+            
             elif self.state in ('a', 'c'):
+                # 读取到 EOF，结束词法分析。
                 if not nextchar:
                     self.state = None   # end of file
                     break
+
+                # 下一个字符是空白字符
                 elif nextchar in self.whitespace:
                     if self.debug >= 2:
                         print("shlex: I see whitespace in word state")
+                    # 当前状态变成空格
                     self.state = ' '
+                    # 如果当前 Token 非空，或者是合法的空引用 Token，
+                    # 则结束本轮读取。
                     if self.token or (self.posix and quoted):
                         break   # emit current token
                     else:
                         continue
+
+                # 判断下一个字符是否是注释
+                # 目前的注释默认是 ''
                 elif nextchar in self.commenters:
                     self.instream.readline()
                     self.lineno += 1
+                    # 
                     if self.posix:
                         self.state = ' '
+                        # 如果形成了有效的token, 那么就退出
                         if self.token or (self.posix and quoted):
                             break   # emit current token
                         else:
                             continue
+
+                # 连续标点符号状态
                 elif self.state == 'c':
+                    # 下一个字符是标点符号
                     if nextchar in self.punctuation_chars:
                         self.token += nextchar
                     else:
+                        # 同时下一个字符也不是空白
                         if nextchar not in self.whitespace:
+                            # 假设下一个不是空白也不是符号，那么一般是字符，需要保存起来
                             self._pushback_chars.append(nextchar)
+                        # 不是标点符号 state = ' '   
                         self.state = ' '
                         break
+                                             
+                # 如果下一个字符是引号，状态变成引号
                 elif self.posix and nextchar in self.quotes:
                     self.state = nextchar
+
+                # 下一个字符是转义符
                 elif self.posix and nextchar in self.escape:
                     escapedstate = 'a'
                     self.state = nextchar
-                elif (nextchar in self.wordchars or nextchar in self.quotes
-                      or (self.whitespace_split and
-                          nextchar not in self.punctuation_chars)):
+  
+                # 当前字符属于普通单词字符或引号，
+                # 或者启用了空白分词且当前字符不是特殊标点，
+                # 则将其直接追加到当前 Token。
+                elif (nextchar in self.wordchars or
+                    nextchar in self.quotes or 
+                    (self.whitespace_split and
+                    nextchar not in self.punctuation_chars)):
+                        
                     self.token += nextchar
+
+                # 当前字符不能继续追加到 Token，需要结束当前 Token，同时保留刚刚读取的字符。
                 else:
                     if self.punctuation_chars:
                         self._pushback_chars.append(nextchar)
@@ -348,6 +535,7 @@ class shlex:
                         break   # emit current token
                     else:
                         continue
+                        
         result = self.token
         self.token = ''
         if self.posix and not quoted and result == '':
